@@ -1,0 +1,19 @@
+name: "get_sports"
+display_name: "Sports Scores"
+description: "Sports scores, live games, and upcoming schedules for Big 4 (NFL, NBA, MLB, NHL) and College teams via ESPN."
+version: "1.0.0"
+min_jarvis_version: "0.9.0"
+license: "MIT"
+author:
+  github: "alexberardi"
+categories: ["information", "sports"]
+platforms: ["darwin", "linux"]
+keywords: ["sports", "scores", "nfl", "nba", "mlb", "nhl", "schedule", "game"]
+
+components:
+  - type: command
+    name: get_sports
+    path: commands/get_sports/command.py
+
+packages:
+  - name: httpx
