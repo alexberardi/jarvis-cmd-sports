@@ -164,7 +164,7 @@ class TestEmission:
 
 
 class TestCards:
-    def test_cards_each_fan_via_generic_inbox(self, agent_mod, monkeypatch, signals_backend, inbox_backend):
+    def test_cards_each_fan_via_generic_inbox(self, agent_mod, monkeypatch, signals_backend, inbox_backend, storage_backend):
         agent = _make_agent(
             agent_mod, monkeypatch, [_PURDUE_FAN, _IU_FAN],
             {"college-basketball": [_game()]},
@@ -183,7 +183,7 @@ class TestCards:
         assert p["title"] == "Final: Boilermakers 78, Hoosiers 70"
         assert "Boilermakers win" in p["summary"]
 
-    def test_card_posted_once_per_fan_per_game(self, agent_mod, monkeypatch, signals_backend, inbox_backend):
+    def test_card_posted_once_per_fan_per_game(self, agent_mod, monkeypatch, signals_backend, inbox_backend, storage_backend):
         agent = _make_agent(
             agent_mod, monkeypatch, [_PURDUE_FAN], {"college-basketball": [_game()]}
         )
@@ -191,7 +191,20 @@ class TestCards:
         asyncio.run(agent.run())  # game still final on the board
         assert len(inbox_backend.posts) == 1
 
-    def test_failed_card_retries_next_poll(self, agent_mod, monkeypatch, signals_backend, inbox_backend):
+    def test_card_dedup_survives_restart(self, agent_mod, monkeypatch, signals_backend, inbox_backend, storage_backend):
+        # The whole point of the durable marker: a fresh agent instance (== a
+        # node restart, in-memory _carded_fans empty) must NOT re-card fans.
+        games = {"college-basketball": [_game()]}
+        agent1 = _make_agent(agent_mod, monkeypatch, [_PURDUE_FAN], games)
+        asyncio.run(agent1.run())
+        assert len(inbox_backend.posts) == 1
+
+        agent2 = _make_agent(agent_mod, monkeypatch, [_PURDUE_FAN], games)
+        assert agent2._carded_fans == set()  # fresh process, no in-memory state
+        asyncio.run(agent2.run())
+        assert len(inbox_backend.posts) == 1  # durable marker blocked the re-card
+
+    def test_failed_card_retries_next_poll(self, agent_mod, monkeypatch, signals_backend, inbox_backend, storage_backend):
         agent = _make_agent(
             agent_mod, monkeypatch, [_PURDUE_FAN], {"college-basketball": [_game()]}
         )
@@ -200,7 +213,7 @@ class TestCards:
         asyncio.run(agent.run())  # inbox healthy again -> retry the unposted fan
         assert len(inbox_backend.posts) == 2
 
-    def test_tie_card_text(self, agent_mod, monkeypatch, signals_backend, inbox_backend):
+    def test_tie_card_text(self, agent_mod, monkeypatch, signals_backend, inbox_backend, storage_backend):
         agent = _make_agent(
             agent_mod, monkeypatch, [_PURDUE_FAN],
             {"college-basketball": [_game(home_score=70, away_score=70)]},
@@ -208,7 +221,7 @@ class TestCards:
         asyncio.run(agent.run())
         assert "Tie game" in inbox_backend.posts[0]["summary"]
 
-    def test_no_fans_no_card(self, agent_mod, monkeypatch, signals_backend, inbox_backend):
+    def test_no_fans_no_card(self, agent_mod, monkeypatch, signals_backend, inbox_backend, storage_backend):
         # Unfavorited game: neither signal nor card.
         agent = _make_agent(
             agent_mod, monkeypatch, [_PURDUE_FAN],

@@ -7,14 +7,16 @@ code knows anything about sports:
    could react to it). Producer pattern mirrors calendar_alerts.
 2. Posts each following household member an informational final-score card via
    the SDK's generic ``JarvisInbox`` (command-center's existing
-   ``/api/v0/node/inbox-item`` path — per-user targeting, push, and durable
-   dedup via the attention broker's ``dedupe_key``). This is the SAME path any
-   package uses to raise a card; it needs zero core changes.
+   ``/api/v0/node/inbox-item`` path — per-user targeting + push). This is the
+   SAME path any package uses to raise a card; it needs zero core changes.
 
-Dedup is in-memory: ``_emitted_finals`` (event_id -> score) re-emits the signal
-only on a CORRECTED final; ``_carded_fans`` ((event, fan) keys) cards each fan
-once per game. A node restart re-runs both — safe: the signal upserts, and the
-card's ``dedupe_key`` lets the attention broker drop the duplicate.
+Dedup: the signal re-emits only on a CORRECTED final (``_emitted_finals``,
+event_id -> score). Cards are one-shot per (game, fan), deduped DURABLY via a
+per-game marker in the node's command-data store (``_store_*_card``) so a
+same-day node restart does not re-notify fans — independent of the attention
+broker (off by default). ``_carded_fans`` is an in-memory fast path over that
+marker; a card's ``dedupe_key`` is a belt-and-suspenders hint the broker honors
+when a household has enabled it.
 """
 
 import asyncio
@@ -28,6 +30,7 @@ from jarvis_command_sdk import (
     IJarvisSecret,
     JarvisInbox,
     JarvisSignals,
+    JarvisStorage,
 )
 
 try:
@@ -47,6 +50,9 @@ except ImportError:
 
         def error(self, msg, **kw):
             self._log.error(msg)
+
+        def debug(self, msg, **kw):
+            self._log.debug(msg)
 
 
 try:
@@ -71,6 +77,11 @@ SIGNAL_KIND = "game.final"
 SOURCE_AGENT = "sports_alerts"
 CARD_SOURCE = "sports_alerts"  # command_name passed to JarvisInbox (source attribution)
 CARD_CATEGORY = "sports"
+# Durable per-game "who's been carded" markers live in the node's own command-data
+# store, so a card is at-most-once across restarts WITHOUT depending on the
+# attention broker (which is off by default per household). Markers auto-expire.
+CARD_STORE = "sports_alerts_cards"
+CARD_MARKER_TTL = timedelta(hours=48)
 
 # Signal lives long enough for evening "did Purdue win?" ambient answers, then
 # expires (a NULL ttl would accumulate stale scores forever — CC hard-deletes
@@ -217,23 +228,28 @@ class SportsAlertsAgent(IJarvisAgent):
         self, game, espn_date: str, favorite_names: List[str], fan_user_ids: List[int]
     ) -> int:
         """Handle one favorited game; returns the poll interval it wants."""
-        # Touch on EVERY sighting so a still-visible game (final or not) is never
-        # pruned out from under an active date — pruning a still-on-board final
-        # would drop its dedup entry and re-emit it.
-        self._touched_at[game.id] = self._now()
-
         if self._is_final(game):
+            # Touch so a still-on-board final isn't pruned out from under an
+            # active date (pruning would harmlessly re-emit the signal; the card
+            # stays deduped durably regardless).
+            self._touched_at[game.id] = self._now()
             await self._handle_final(game, favorite_names, fan_user_ids)
             self._tracked_dates.pop(game.id, None)
             return IDLE_INTERVAL_SECONDS
 
+        if game.state == "post":
+            # Postponed/suspended (not final): do NOT keep tracking it, or its
+            # date would be polled forever. If it's rescheduled it reappears on a
+            # polled date (today is always polled); its stale tracking ages out.
+            self._tracked_dates.pop(game.id, None)
+            return IDLE_INTERVAL_SECONDS
+
+        # Pre-game or in-progress: keep it (and its date) alive for polling.
+        self._touched_at[game.id] = self._now()
         self._tracked_dates[game.id] = espn_date
 
         if game.state == "in":
             return LIVE_INTERVAL_SECONDS
-        if game.state == "post":
-            # Postponed/suspended: nothing imminent.
-            return IDLE_INTERVAL_SECONDS
         # Pre-game (or unknown state): speed up close to start; if the start
         # time is unknown, stay warm — a favorite plays today.
         start = game.start_time
@@ -312,13 +328,20 @@ class SportsAlertsAgent(IJarvisAgent):
     async def _post_cards(
         self, game, favorite_names: List[str], fan_user_ids: List[int]
     ) -> None:
-        """Post each following member an informational final-score card.
+        """Post each following member an informational final-score card ONCE.
 
         Generic delivery via JarvisInbox — the same node->card path any package
-        uses, so command-center needs no sports-specific code. The per-(game,fan)
-        dedupe_key lets the attention broker drop a duplicate after a restart; the
-        in-memory ``_carded_fans`` set covers the common case and retries a fan
-        whose post failed.
+        uses, so command-center needs no sports-specific code. Dedup is durable:
+        a per-game marker in the node's command-data store survives restarts, so
+        a same-day node restart (common on a Pi Zero) does NOT re-notify fans —
+        this does not depend on the attention broker, which is off by default.
+        The in-memory ``_carded_fans`` set is just a fast path over that marker;
+        a fan whose post failed stays unmarked and retries next poll.
+
+        NOTE: cards are one-shot per game. A later ESPN score CORRECTION re-emits
+        the signal (so ambient "what was the score?" updates) but deliberately
+        does NOT re-push a card — a duplicate notification for a stat fix is worse
+        than a slightly stale card.
         """
         if not fan_user_ids:
             return
@@ -329,27 +352,63 @@ class SportsAlertsAgent(IJarvisAgent):
             if key in self._carded_fans:
                 continue
             try:
-                tag = await asyncio.to_thread(
-                    lambda uid=user_id: JarvisInbox(CARD_SOURCE).post(
-                        title=title,
-                        summary=summary,
-                        body=body,
-                        category=CARD_CATEGORY,
-                        user_id=uid,
-                        target_type="user",
-                        create_push_notification=True,
-                        metadata={"dedupe_key": f"gamecard:{game.id}:{uid}"},
-                    )
+                # Durable-check + post + durable-record all run in one worker
+                # thread (SQLCipher reads and the HTTP post are both blocking).
+                carded = await asyncio.to_thread(
+                    self._card_one_fan, game.id, user_id, title, summary, body
                 )
             except Exception as e:  # noqa: BLE001
                 logger.error("game.final card raised", event_id=game.id, error=str(e))
                 continue
-            if tag in ("ok", "no_backend"):
-                self._carded_fans.add(key)  # per-fan: a failed post retries next poll
-            else:
-                logger.warning(
-                    "game.final card not accepted", event_id=game.id, user_id=user_id, tag=tag
-                )
+            if carded:
+                self._carded_fans.add(key)
+
+    def _card_one_fan(
+        self, game_id: str, user_id: int, title: str, summary: str, body: str
+    ) -> bool:
+        """Card one fan unless already carded (durable). Runs in a worker thread."""
+        if self._store_has_card(game_id, user_id):
+            return True  # carded in a prior process — survives restart
+        tag = JarvisInbox(CARD_SOURCE).post(
+            title=title,
+            summary=summary,
+            body=body,
+            category=CARD_CATEGORY,
+            user_id=user_id,
+            target_type="user",
+            create_push_notification=True,
+            metadata={"dedupe_key": f"gamecard:{game_id}:{user_id}"},
+        )
+        if tag in ("ok", "no_backend"):
+            self._store_add_card(game_id, user_id)
+            return True
+        logger.warning(
+            "game.final card not accepted", event_id=game_id, user_id=user_id, tag=tag
+        )
+        return False
+
+    @staticmethod
+    def _store_has_card(game_id: str, user_id: int) -> bool:
+        try:
+            rec = JarvisStorage(CARD_STORE).get(f"gamecard:{game_id}")
+            return bool(rec) and user_id in (rec.get("fans") or [])
+        except Exception:  # noqa: BLE001 — storage down: fall back to in-memory only
+            return False
+
+    @staticmethod
+    def _store_add_card(game_id: str, user_id: int) -> None:
+        try:
+            store = JarvisStorage(CARD_STORE)
+            existing = store.get(f"gamecard:{game_id}")
+            fans = set(existing.get("fans") or []) if existing else set()
+            fans.add(user_id)
+            store.save(
+                f"gamecard:{game_id}",
+                {"game_id": game_id, "fans": sorted(fans)},
+                expires_at=datetime.now(timezone.utc) + CARD_MARKER_TTL,
+            )
+        except Exception:  # noqa: BLE001 — best-effort; worst case a dup after restart
+            logger.debug("game.final card marker save failed", exc_info=True)
 
     @staticmethod
     def _card_text(game, winner: str, favorite_names: List[str]) -> tuple:
