@@ -57,6 +57,28 @@ def signals_backend():
     set_signals_backend(None)
 
 
+class CapturingInboxBackend:
+    """SDK InboxBackend that records posted cards; scriptable return tag."""
+
+    def __init__(self) -> None:
+        self.posts: list[dict] = []
+        self.tags: list[str] = []  # pop-from-front script; default "ok"
+
+    def post_inbox_item(self, command_name, **kwargs):
+        self.posts.append({"command_name": command_name, **kwargs})
+        return self.tags.pop(0) if self.tags else "ok"
+
+
+@pytest.fixture
+def inbox_backend():
+    from jarvis_command_sdk.inbox import set_inbox_backend
+
+    backend = CapturingInboxBackend()
+    set_inbox_backend(backend)
+    yield backend
+    set_inbox_backend(None)
+
+
 class FakeStorageBackend:
     """In-memory SDK StorageBackend covering the data + secret surface."""
 

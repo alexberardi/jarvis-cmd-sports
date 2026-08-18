@@ -56,6 +56,8 @@ def _game(
     completed=True,
     state="post",
     start_time=None,
+    home_display="Indiana Hoosiers",
+    away_display="Purdue Boilermakers",
 ):
     return Game(
         id=event_id,
@@ -68,8 +70,8 @@ def _game(
         league=league,
         completed=completed,
         state=state,
-        home_display="Indiana Hoosiers",
-        away_display="Purdue Boilermakers",
+        home_display=home_display,
+        away_display=away_display,
     )
 
 
@@ -85,7 +87,7 @@ _IU_FAN = Favorite(user_id=5, team_name="Indiana", league="college-basketball")
 
 
 class TestEmission:
-    def test_final_emits_contract_payload(self, agent_mod, monkeypatch, signals_backend):
+    def test_final_emits_clean_fact(self, agent_mod, monkeypatch, signals_backend):
         agent = _make_agent(
             agent_mod, monkeypatch, [_PURDUE_FAN, _IU_FAN],
             {"college-basketball": [_game()]},
@@ -102,9 +104,7 @@ class TestEmission:
         assert signal["source_agent"] == "sports_alerts"
         assert signal["ttl_seconds"] == agent_mod.SIGNAL_TTL_SECONDS
         assert signal["cacheable"] is False
-        assert "scope" not in signal  # household-wide; fans ride in facts
-        assert "Boilermakers 78" in signal["summary"]
-        assert "Hoosiers 70" in signal["summary"]
+        assert "scope" not in signal  # household-wide fact
 
         facts = payload["data"]
         assert facts["event_id"] == "401"
@@ -114,8 +114,10 @@ class TestEmission:
         assert facts["home_score"] == 70
         assert facts["away_score"] == 78
         assert facts["winner"] == "Boilermakers"
-        assert facts["fan_user_ids"] == [3, 5]
-        assert facts["favorite_teams"] == ["Indiana", "Purdue"]
+        # The signal is the pure FACT — delivery targeting (which fans) is NOT
+        # part of it; that lives in the card path.
+        assert "fan_user_ids" not in facts
+        assert "favorite_teams" not in facts
 
     def test_unchanged_final_not_re_emitted(self, agent_mod, monkeypatch, signals_backend):
         agent = _make_agent(
@@ -159,6 +161,64 @@ class TestEmission:
         )
         asyncio.run(agent.run())
         assert signals_backend.payloads[0]["data"]["winner"] == ""
+
+
+class TestCards:
+    def test_cards_each_fan_via_generic_inbox(self, agent_mod, monkeypatch, signals_backend, inbox_backend):
+        agent = _make_agent(
+            agent_mod, monkeypatch, [_PURDUE_FAN, _IU_FAN],
+            {"college-basketball": [_game()]},
+        )
+        asyncio.run(agent.run())
+
+        assert len(inbox_backend.posts) == 2
+        targeted = {p["user_id"] for p in inbox_backend.posts}
+        assert targeted == {3, 5}
+        p = inbox_backend.posts[0]
+        assert p["command_name"] == "sports_alerts"
+        assert p["category"] == "sports"
+        assert p["target_type"] == "user"
+        assert p["create_push_notification"] is True
+        assert p["metadata"]["dedupe_key"] == f"gamecard:401:{p['user_id']}"
+        assert p["title"] == "Final: Boilermakers 78, Hoosiers 70"
+        assert "Boilermakers win" in p["summary"]
+
+    def test_card_posted_once_per_fan_per_game(self, agent_mod, monkeypatch, signals_backend, inbox_backend):
+        agent = _make_agent(
+            agent_mod, monkeypatch, [_PURDUE_FAN], {"college-basketball": [_game()]}
+        )
+        asyncio.run(agent.run())
+        asyncio.run(agent.run())  # game still final on the board
+        assert len(inbox_backend.posts) == 1
+
+    def test_failed_card_retries_next_poll(self, agent_mod, monkeypatch, signals_backend, inbox_backend):
+        agent = _make_agent(
+            agent_mod, monkeypatch, [_PURDUE_FAN], {"college-basketball": [_game()]}
+        )
+        inbox_backend.tags = ["http_error"]
+        asyncio.run(agent.run())
+        asyncio.run(agent.run())  # inbox healthy again -> retry the unposted fan
+        assert len(inbox_backend.posts) == 2
+
+    def test_tie_card_text(self, agent_mod, monkeypatch, signals_backend, inbox_backend):
+        agent = _make_agent(
+            agent_mod, monkeypatch, [_PURDUE_FAN],
+            {"college-basketball": [_game(home_score=70, away_score=70)]},
+        )
+        asyncio.run(agent.run())
+        assert "Tie game" in inbox_backend.posts[0]["summary"]
+
+    def test_no_fans_no_card(self, agent_mod, monkeypatch, signals_backend, inbox_backend):
+        # Unfavorited game: neither signal nor card.
+        agent = _make_agent(
+            agent_mod, monkeypatch, [_PURDUE_FAN],
+            {"college-basketball": [_game(home="Bulldogs", away="Wildcats",
+                                          home_display="Georgia Bulldogs",
+                                          away_display="Kansas State Wildcats")]},
+        )
+        asyncio.run(agent.run())
+        assert inbox_backend.posts == []
+        assert signals_backend.payloads == []
 
 
 class TestPruneDoesNotResurrectFinals:

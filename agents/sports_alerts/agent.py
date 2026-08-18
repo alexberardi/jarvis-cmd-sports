@@ -1,16 +1,20 @@
-"""Sports score watcher: polls ESPN scoreboards for favorited teams and emits a
-``game.final`` Signal when a game goes final.
+"""Sports score watcher: polls ESPN scoreboards for favorited teams. When a game
+goes final it does two INDEPENDENT, fully generic things — no command-center
+code knows anything about sports:
 
-Producer side of the game.final feature (see sports_shared/favorites.py for the
-favorites contract). The judgment about what to DO with a final score — card,
-automation, ambient answer — lives server-side in command-center; this agent
-only reports the fact, mirroring the calendar_alerts producer pattern.
+1. Emits a ``game.final`` Signal — the reusable FACT (renders in ambient voice
+   context so "did Purdue win?" answers with no tool call; a future automation
+   could react to it). Producer pattern mirrors calendar_alerts.
+2. Posts each following household member an informational final-score card via
+   the SDK's generic ``JarvisInbox`` (command-center's existing
+   ``/api/v0/node/inbox-item`` path — per-user targeting, push, and durable
+   dedup via the attention broker's ``dedupe_key``). This is the SAME path any
+   package uses to raise a card; it needs zero core changes.
 
-Dedup is in-memory keyed event_id -> final (home, away) score, so a CORRECTED
-final re-emits (command-center upserts on source_key) while an unchanged final
-does not. A node restart re-emits finals still on today's scoreboard; that is
-safe by design: the signal upserts and command-center's card reaction holds a
-durable per-(game, fan) claim.
+Dedup is in-memory: ``_emitted_finals`` (event_id -> score) re-emits the signal
+only on a CORRECTED final; ``_carded_fans`` ((event, fan) keys) cards each fan
+once per game. A node restart re-runs both — safe: the signal upserts, and the
+card's ``dedupe_key`` lets the attention broker drop the duplicate.
 """
 
 import asyncio
@@ -18,7 +22,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
-from jarvis_command_sdk import AgentSchedule, IJarvisAgent, IJarvisSecret, JarvisSignals
+from jarvis_command_sdk import (
+    AgentSchedule,
+    IJarvisAgent,
+    IJarvisSecret,
+    JarvisInbox,
+    JarvisSignals,
+)
 
 try:
     from jarvis_log_client import JarvisLogger
@@ -59,6 +69,8 @@ logger = JarvisLogger(service="agent.sports_alerts")
 
 SIGNAL_KIND = "game.final"
 SOURCE_AGENT = "sports_alerts"
+CARD_SOURCE = "sports_alerts"  # command_name passed to JarvisInbox (source attribution)
+CARD_CATEGORY = "sports"
 
 # Signal lives long enough for evening "did Purdue win?" ambient answers, then
 # expires (a NULL ttl would accumulate stale scores forever — CC hard-deletes
@@ -92,8 +104,10 @@ class SportsAlertsAgent(IJarvisAgent):
         # class in a bare subprocess.
         self._espn = None
         self._interval = IDLE_INTERVAL_SECONDS
-        # event_id -> (home_score, away_score) of the emitted final
+        # event_id -> (home_score, away_score) of the emitted final signal
         self._emitted_finals: Dict[str, tuple] = {}
+        # "event_id:user_id" keys already carded (one card per fan per game)
+        self._carded_fans: set[str] = set()
         # event_id -> ESPN date (YYYYMMDD) the unresolved game was found under
         self._tracked_dates: Dict[str, str] = {}
         # event_id -> last-touched (emitted or tracked), for pruning
@@ -209,7 +223,7 @@ class SportsAlertsAgent(IJarvisAgent):
         self._touched_at[game.id] = self._now()
 
         if self._is_final(game):
-            await self._maybe_emit_final(game, favorite_names, fan_user_ids)
+            await self._handle_final(game, favorite_names, fan_user_ids)
             self._tracked_dates.pop(game.id, None)
             return IDLE_INTERVAL_SECONDS
 
@@ -237,20 +251,28 @@ class SportsAlertsAgent(IJarvisAgent):
         # payloads where completed is missing.
         return bool(game.completed) or "FINAL" in (game.status or "").upper()
 
-    # ── Emission ──────────────────────────────────────────────────────────
+    # ── Final handling: signal (fact) + cards (notification) ───────────────
 
-    async def _maybe_emit_final(
+    async def _handle_final(
         self, game, favorite_names: List[str], fan_user_ids: List[int]
     ) -> None:
         if game.home_score is None or game.away_score is None:
             return  # final without scores — corrupt payload, retry next poll
+        await self._emit_signal(game)
+        await self._post_cards(game, favorite_names, fan_user_ids)
+
+    async def _emit_signal(self, game) -> None:
+        """Emit the household-wide game.final FACT (ambient / future automations).
+
+        The signal carries only the game itself — WHO to notify is a delivery
+        concern handled by the card path, not part of the fact.
+        """
         score = (game.home_score, game.away_score)
         if self._emitted_finals.get(game.id) == score:
             return  # unchanged; a corrected final (score change) re-emits
 
         league_value = game.league.value
         winner = self._winner(game)
-        summary = self._summary(game, winner)
         facts = {
             "event_id": str(game.id),
             "league": league_value,
@@ -259,8 +281,6 @@ class SportsAlertsAgent(IJarvisAgent):
             "home_score": game.home_score,
             "away_score": game.away_score,
             "winner": winner,
-            "favorite_teams": favorite_names,
-            "fan_user_ids": fan_user_ids,
         }
         try:
             # emit() POSTs to command-center synchronously — offload so a slow/
@@ -271,7 +291,7 @@ class SportsAlertsAgent(IJarvisAgent):
                     kind=SIGNAL_KIND,
                     source_key=f"game:{league_value}:{game.id}",
                     subject=str(game.id),
-                    summary=summary,
+                    summary=self._summary(game, winner),
                     facts=facts,
                     ttl_seconds=SIGNAL_TTL_SECONDS,
                     cacheable=False,
@@ -288,6 +308,64 @@ class SportsAlertsAgent(IJarvisAgent):
             self._touched_at[game.id] = self._now()
         else:
             logger.warning("game.final emit not accepted", event_id=game.id, tag=tag)
+
+    async def _post_cards(
+        self, game, favorite_names: List[str], fan_user_ids: List[int]
+    ) -> None:
+        """Post each following member an informational final-score card.
+
+        Generic delivery via JarvisInbox — the same node->card path any package
+        uses, so command-center needs no sports-specific code. The per-(game,fan)
+        dedupe_key lets the attention broker drop a duplicate after a restart; the
+        in-memory ``_carded_fans`` set covers the common case and retries a fan
+        whose post failed.
+        """
+        if not fan_user_ids:
+            return
+        winner = self._winner(game)
+        title, summary, body = self._card_text(game, winner, favorite_names)
+        for user_id in fan_user_ids:
+            key = f"{game.id}:{user_id}"
+            if key in self._carded_fans:
+                continue
+            try:
+                tag = await asyncio.to_thread(
+                    lambda uid=user_id: JarvisInbox(CARD_SOURCE).post(
+                        title=title,
+                        summary=summary,
+                        body=body,
+                        category=CARD_CATEGORY,
+                        user_id=uid,
+                        target_type="user",
+                        create_push_notification=True,
+                        metadata={"dedupe_key": f"gamecard:{game.id}:{uid}"},
+                    )
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error("game.final card raised", event_id=game.id, error=str(e))
+                continue
+            if tag in ("ok", "no_backend"):
+                self._carded_fans.add(key)  # per-fan: a failed post retries next poll
+            else:
+                logger.warning(
+                    "game.final card not accepted", event_id=game.id, user_id=user_id, tag=tag
+                )
+
+    @staticmethod
+    def _card_text(game, winner: str, favorite_names: List[str]) -> tuple:
+        label = league_label(game.league.value) if league_label else game.league.value
+        title = (
+            f"Final: {game.away_team} {game.away_score}, "
+            f"{game.home_team} {game.home_score}"
+        )
+        summary = f"{winner} win ({label})" if winner else f"Tie game ({label})"
+        body_lines = [
+            f"{game.away_team} {game.away_score} — {game.home_team} {game.home_score}",
+            label,
+        ]
+        if favorite_names:
+            body_lines.append("Following: " + ", ".join(favorite_names))
+        return title, summary, "\n".join(body_lines)
 
     @staticmethod
     def _winner(game) -> str:
@@ -317,3 +395,6 @@ class SportsAlertsAgent(IJarvisAgent):
             self._touched_at.pop(eid, None)
             self._emitted_finals.pop(eid, None)
             self._tracked_dates.pop(eid, None)
+            prefix = f"{eid}:"
+            for key in [k for k in self._carded_fans if k.startswith(prefix)]:
+                self._carded_fans.discard(key)
