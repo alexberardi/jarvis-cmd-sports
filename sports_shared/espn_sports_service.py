@@ -135,15 +135,16 @@ class TeamNameResolver:
         for city, nickname in college_football_teams:
             teams.append(Team(League.COLLEGE_FOOTBALL, city, nickname, f"{city} {nickname}"))
         
-        # College Basketball Teams (Power 5 + Big East)
-        college_basketball_teams = [
-            # Add major basketball programs from the same conferences
-            # Many overlap with football, but some are basketball-only
+        # College Basketball Teams: every school in the football list also fields
+        # a basketball program (without this, "Purdue" resolves to college-football
+        # only and basketball scoreboards are never searched), plus programs that
+        # are basketball-only or basketball-first.
+        college_basketball_teams = college_football_teams + [
             ("Gonzaga", "Bulldogs"), ("Memphis", "Tigers"), ("Houston", "Cougars"), ("Cincinnati", "Bearcats"),
             ("Wichita State", "Shockers"), ("Dayton", "Flyers"), ("Saint Mary's", "Gaels"), ("BYU", "Cougars"),
             ("San Diego State", "Aztecs"), ("Boise State", "Broncos"), ("Nevada", "Wolf Pack"), ("UNLV", "Runnin' Rebels")
         ]
-        
+
         for city, nickname in college_basketball_teams:
             teams.append(Team(League.COLLEGE_BASKETBALL, city, nickname, f"{city} {nickname}"))
         
@@ -540,11 +541,17 @@ class Game:
     away_team: str
     home_score: Optional[int]
     away_score: Optional[int]
-    status: str  # "scheduled", "live", "final"
+    status: str  # raw ESPN status.type.name, e.g. "STATUS_SCHEDULED"/"STATUS_FINAL"
     start_time: Optional[datetime]
     league: League
     venue: Optional[str] = None
     broadcast: Optional[str] = None
+    completed: bool = False  # status.type.completed — True only for a final WITH a result
+    state: Optional[str] = None  # status.type.state: "pre" | "in" | "post"
+    # Postponed games are state="post" with completed=False — `state == "post"`
+    # alone is NOT "game over"; key on `completed` (or "FINAL" in status).
+    home_display: Optional[str] = None  # full "City Nickname" (home_team is bare nickname)
+    away_display: Optional[str] = None
 
 
 # Main service class
@@ -653,7 +660,10 @@ class ESPNSportsService:
             for event in events:
                 try:
                     game_id = event.get("id", "")
-                    status = event.get("status", {}).get("type", {}).get("name", "scheduled")
+                    status_type = event.get("status", {}).get("type", {})
+                    status = status_type.get("name", "scheduled")
+                    completed = bool(status_type.get("completed", False))
+                    state = status_type.get("state")
                     
                     # Get teams
                     competitions = event.get("competitions", [])
@@ -667,18 +677,28 @@ class ESPNSportsService:
                     away_team = None
                     home_score = None
                     away_score = None
-                    
+                    home_display = None
+                    away_display = None
+
                     for competitor in competitors:
-                        team_name = competitor.get("team", {}).get("name", "")
+                        team = competitor.get("team", {})
+                        team_name = team.get("name", "")
+                        # displayName is the full "City Nickname" (e.g. "Kentucky
+                        # Wildcats"); team.name is the bare nickname, which collides
+                        # across schools ("Wildcats", "Tigers"). Keep both so callers
+                        # can disambiguate same-nickname teams by city.
+                        display_name = team.get("displayName") or team_name
                         score = competitor.get("score", "")
                         home_away = competitor.get("homeAway", "")
-                        
-                        
+
+
                         if home_away == "home":
                             home_team = team_name
+                            home_display = display_name
                             home_score = int(score) if score.isdigit() else None
                         elif home_away == "away":
                             away_team = team_name
+                            away_display = display_name
                             away_score = int(score) if score.isdigit() else None
                     
                     if not home_team or not away_team:
@@ -711,7 +731,11 @@ class ESPNSportsService:
                         start_time=start_time,
                         league=sport,
                         venue=venue,
-                        broadcast=broadcast
+                        broadcast=broadcast,
+                        completed=completed,
+                        state=state,
+                        home_display=home_display or home_team,
+                        away_display=away_display or away_team
                     )
                     
                     games.append(game)

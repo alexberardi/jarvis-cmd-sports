@@ -1,19 +1,25 @@
 name: "get_sports"
 display_name: "Sports Scores"
-description: "Sports scores, live games, and upcoming schedules for Big 4 (NFL, NBA, MLB, NHL) and College teams via ESPN."
-version: "1.0.0"
-min_jarvis_version: "0.9.0"
+description: "Sports scores, live games, and upcoming schedules for Big 4 (NFL, NBA, MLB, NHL) and College teams via ESPN. Favorite teams get an automatic final-score card via the sports_alerts agent."
+version: "1.1.0"
+# Node v0.1.115 is the first release with version-floor enforcement; SDK 0.8.0
+# adds JarvisSignals (the sports_alerts agent emits game.final through it).
+min_jarvis_version: "0.1.115"
+min_sdk_version: "0.8.0"
 license: Apache-2.0
 author:
   github: "alexberardi"
 categories: ["information", "sports"]
 platforms: ["darwin", "linux"]
-keywords: ["sports", "scores", "nfl", "nba", "mlb", "nhl", "schedule", "game"]
+keywords: ["sports", "scores", "nfl", "nba", "mlb", "nhl", "schedule", "game", "favorites", "final score"]
 
 components:
   - type: command
     name: get_sports
     path: commands/get_sports/command.py
+  - type: agent
+    name: sports_alerts
+    path: agents/sports_alerts/agent.py
 
 packages:
   - name: httpx
