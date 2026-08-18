@@ -151,6 +151,19 @@ class SportsCommand(IJarvisCommand):
         title = str(team) if team else "Favorite team"
         league = record.get("league")
         subtitle = league_label(league) if league_label else league
+        # The mobile EDIT path does a generic field overlay with no revalidation,
+        # so a favorite can be edited into a team/league that resolves to nothing
+        # (the agent then silently never matches it). Surface that here so a dead
+        # row is visible in the browser list rather than mysteriously quiet.
+        if (
+            resolve_in_league is not None
+            and isinstance(team, str)
+            and team.strip()
+            and isinstance(league, str)
+            and not resolve_in_league(team.strip(), league)
+        ):
+            subtitle = f"⚠ not a valid {subtitle} team"
+            return RecordSummary(title=title, subtitle=subtitle, icon="alert-outline")
         return RecordSummary(title=title, subtitle=subtitle, icon="star-outline")
 
     def data_browser_create(
@@ -161,7 +174,7 @@ class SportsCommand(IJarvisCommand):
         if not team_name:
             raise ValueError("team_name is required")
         valid_leagues = league_values() if league_values else []
-        if league not in valid_leagues:
+        if not isinstance(league, str) or league not in valid_leagues:
             raise ValueError(
                 f"league must be one of: {', '.join(valid_leagues)}"
             )

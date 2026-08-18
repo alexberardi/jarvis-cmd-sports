@@ -550,6 +550,8 @@ class Game:
     state: Optional[str] = None  # status.type.state: "pre" | "in" | "post"
     # Postponed games are state="post" with completed=False — `state == "post"`
     # alone is NOT "game over"; key on `completed` (or "FINAL" in status).
+    home_display: Optional[str] = None  # full "City Nickname" (home_team is bare nickname)
+    away_display: Optional[str] = None
 
 
 # Main service class
@@ -675,18 +677,28 @@ class ESPNSportsService:
                     away_team = None
                     home_score = None
                     away_score = None
-                    
+                    home_display = None
+                    away_display = None
+
                     for competitor in competitors:
-                        team_name = competitor.get("team", {}).get("name", "")
+                        team = competitor.get("team", {})
+                        team_name = team.get("name", "")
+                        # displayName is the full "City Nickname" (e.g. "Kentucky
+                        # Wildcats"); team.name is the bare nickname, which collides
+                        # across schools ("Wildcats", "Tigers"). Keep both so callers
+                        # can disambiguate same-nickname teams by city.
+                        display_name = team.get("displayName") or team_name
                         score = competitor.get("score", "")
                         home_away = competitor.get("homeAway", "")
-                        
-                        
+
+
                         if home_away == "home":
                             home_team = team_name
+                            home_display = display_name
                             home_score = int(score) if score.isdigit() else None
                         elif home_away == "away":
                             away_team = team_name
+                            away_display = display_name
                             away_score = int(score) if score.isdigit() else None
                     
                     if not home_team or not away_team:
@@ -721,7 +733,9 @@ class ESPNSportsService:
                         venue=venue,
                         broadcast=broadcast,
                         completed=completed,
-                        state=state
+                        state=state,
+                        home_display=home_display or home_team,
+                        away_display=away_display or away_team
                     )
                     
                     games.append(game)

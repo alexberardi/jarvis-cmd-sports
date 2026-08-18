@@ -61,7 +61,13 @@ def league_label(value: str | None) -> str:
 
 
 def parse_favorites(records: list[dict[str, Any]] | None) -> list[Favorite]:
-    """Valid favorites from raw JarvisStorage rows; malformed rows are skipped."""
+    """Valid favorites from raw JarvisStorage rows; malformed rows are skipped.
+
+    Every field is type-guarded before use: a record whose ``league`` is a
+    non-string (e.g. a double-encoded ``[]``) must be skipped, not raise — a
+    single bad row would otherwise take the ``in`` membership test down and,
+    via ``load_favorites``'s catch-all, silently disable all alerts.
+    """
     valid_leagues = set(league_values())
     favorites: list[Favorite] = []
     for record in records or []:
@@ -72,7 +78,7 @@ def parse_favorites(records: list[dict[str, Any]] | None) -> list[Favorite]:
         user_id = record.get("user_id")
         if not team_name or not isinstance(team_name, str):
             continue
-        if league not in valid_leagues:
+        if not isinstance(league, str) or league not in valid_leagues:
             continue
         if not isinstance(user_id, int) or isinstance(user_id, bool):
             continue
@@ -97,28 +103,85 @@ def load_favorites() -> list[Favorite]:
 
 
 def resolve_in_league(team_name: str, league: str) -> list:
-    """Teams matching ``team_name`` restricted to the declared league."""
+    """Teams matching ``team_name`` restricted to the declared league.
+
+    The resolver's alias table maps a bare city/school word to a NICKNAME
+    ("kentucky" -> "Wildcats"), which then expands to every same-nickname school
+    (Villanova, Northwestern, ...). That over-match would card a Kentucky fan for
+    a Villanova game. So when the input actually names a city/school, narrow to
+    the teams whose city or full name contains it; a pure-nickname input
+    ("Lakers") keeps its unique match unchanged.
+    """
     resolver = _get_resolver()
     if resolver is None or not team_name:
         return []
-    return [t for t in resolver.resolve_team(team_name) if t.league.value == league]
+    teams = [t for t in resolver.resolve_team(team_name) if t.league.value == league]
+    needle = team_name.casefold().strip()
+    specific = [
+        t
+        for t in teams
+        if needle in (t.city or "").casefold()
+        or needle in (t.full_name or "").casefold()
+    ]
+    return specific or teams
 
 
-def fans_for_game(favorites: list[Favorite], game) -> tuple[list[str], list[int]]:
+@dataclass(frozen=True)
+class ResolvedFavorite:
+    """A favorite with its resolved teams — computed once per poll, not per game."""
+
+    favorite: Favorite
+    teams: tuple  # resolved Team objects (in the favorite's league)
+
+
+def resolve_favorites(favorites: list[Favorite]) -> list[ResolvedFavorite]:
+    """Resolve every favorite's teams ONCE (O(favorites x team-DB)), so game
+    matching is a cheap in-memory scan rather than re-resolving per game."""
+    resolved: list[ResolvedFavorite] = []
+    for favorite in favorites:
+        teams = tuple(resolve_in_league(favorite.team_name, favorite.league))
+        if teams:
+            resolved.append(ResolvedFavorite(favorite=favorite, teams=teams))
+    return resolved
+
+
+def _team_in_side(team, side_name: str | None, side_display: str | None) -> bool:
+    """Does a resolved Team identify this game side?
+
+    ESPN's ``side_name`` is the BARE nickname ("Wildcats"), which collides across
+    schools, so nickname EQUALITY (not substring — "Cardinal" != "Cardinals") is
+    the floor. For college, many schools share a nickname, so the team's city
+    must also appear in the full ``side_display`` ("Kentucky Wildcats"). Pro
+    nicknames are unique in-league, so the city token is present there too
+    ("Cincinnati" in "Cincinnati Reds") — a single rule covers both.
+    """
+    nickname = (team.nickname or "").casefold()
+    if not nickname or nickname != (side_name or "").casefold():
+        return False
+    display = (side_display or side_name or "").casefold()
+    city = (team.city or "").casefold()
+    return not city or city in display
+
+
+def fans_for_game(
+    resolved_favorites: list[ResolvedFavorite], game
+) -> tuple[list[str], list[int]]:
     """(favorited team names involved in ``game``, fan user ids) for one Game.
 
-    Matching mirrors ESPNSportsService.get_team_scores: a favorite counts when
-    one of its resolved nicknames appears in the game's home or away name.
+    A favorite counts only when its resolved team identity (nickname + city)
+    matches a game side — NOT a bare-nickname substring, which would card fans
+    of a different same-nickname school (Kentucky vs Villanova "Wildcats").
     """
     names: set[str] = set()
     fans: set[int] = set()
     game_league = game.league.value if game.league is not None else None
-    for favorite in favorites:
-        if favorite.league != game_league:
+    for rf in resolved_favorites:
+        if rf.favorite.league != game_league:
             continue
-        for team in resolve_in_league(favorite.team_name, favorite.league):
-            if team.nickname in game.home_team or team.nickname in game.away_team:
-                names.add(favorite.team_name)
-                fans.add(favorite.user_id)
+        for team in rf.teams:
+            if _team_in_side(team, game.home_team, getattr(game, "home_display", None)) or \
+               _team_in_side(team, game.away_team, getattr(game, "away_display", None)):
+                names.add(rf.favorite.team_name)
+                fans.add(rf.favorite.user_id)
                 break
     return sorted(names), sorted(fans)

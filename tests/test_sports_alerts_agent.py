@@ -68,6 +68,8 @@ def _game(
         league=league,
         completed=completed,
         state=state,
+        home_display="Indiana Hoosiers",
+        away_display="Purdue Boilermakers",
     )
 
 
@@ -157,6 +159,28 @@ class TestEmission:
         )
         asyncio.run(agent.run())
         assert signals_backend.payloads[0]["data"]["winner"] == ""
+
+
+class TestPruneDoesNotResurrectFinals:
+    def test_still_on_board_final_survives_prune(self, agent_mod, monkeypatch, signals_backend):
+        # Regression: a final that stays on the ESPN board must keep its dedup
+        # entry refreshed on every sighting, so a co-tracked game keeping the
+        # date polled can't let prune evict it and cause a spurious re-emit.
+        agent = _make_agent(
+            agent_mod, monkeypatch, [_PURDUE_FAN], {"college-basketball": [_game()]}
+        )
+        asyncio.run(agent.run())
+        assert len(signals_backend.payloads) == 1
+
+        # Simulate 40h passing with no refresh of the frozen entry...
+        from datetime import timedelta
+        old = agent._now() - timedelta(hours=40)
+        agent._touched_at["401"] = old
+        # ...then the final is still on the board on the next poll.
+        asyncio.run(agent.run())
+        # Touched-on-sighting keeps it alive → prune leaves it → no re-emit.
+        assert len(signals_backend.payloads) == 1
+        assert "401" in agent._emitted_finals
 
 
 class TestNonFinals:

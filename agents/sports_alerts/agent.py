@@ -41,13 +41,19 @@ except ImportError:
 
 try:
     from sports_shared.espn_sports_service import ESPNSportsService, League
-    from sports_shared.favorites import fans_for_game, league_label, load_favorites
+    from sports_shared.favorites import (
+        fans_for_game,
+        league_label,
+        load_favorites,
+        resolve_favorites,
+    )
 except ImportError:
     ESPNSportsService = None
     League = None
     fans_for_game = None
     league_label = None
     load_favorites = None
+    resolve_favorites = None
 
 logger = JarvisLogger(service="agent.sports_alerts")
 
@@ -153,12 +159,13 @@ class SportsAlertsAgent(IJarvisAgent):
             return
 
         favorites = await asyncio.to_thread(load_favorites)
-        if not favorites:
+        resolved = resolve_favorites(favorites) if favorites else []
+        if not resolved:
             self._interval = IDLE_INTERVAL_SECONDS
             self._prune()
             return
 
-        leagues = sorted({favorite.league for favorite in favorites})
+        leagues = sorted({rf.favorite.league for rf in resolved})
         dates = self._dates_to_poll()
         service = self._service()
 
@@ -182,27 +189,31 @@ class SportsAlertsAgent(IJarvisAgent):
                 for game in games:
                     if game.id in seen_event_ids:
                         continue  # same game can appear under two polled dates
-                    names, fans = fans_for_game(favorites, game)
+                    names, fans = fans_for_game(resolved, game)
                     if not fans:
                         continue
                     seen_event_ids.add(game.id)
-                    interval = self._process_game(game, espn_date, names, fans)
+                    interval = await self._process_game(game, espn_date, names, fans)
                     next_interval = min(next_interval, interval)
 
         self._interval = next_interval
         self._prune()
 
-    def _process_game(
+    async def _process_game(
         self, game, espn_date: str, favorite_names: List[str], fan_user_ids: List[int]
     ) -> int:
         """Handle one favorited game; returns the poll interval it wants."""
+        # Touch on EVERY sighting so a still-visible game (final or not) is never
+        # pruned out from under an active date — pruning a still-on-board final
+        # would drop its dedup entry and re-emit it.
+        self._touched_at[game.id] = self._now()
+
         if self._is_final(game):
-            self._maybe_emit_final(game, favorite_names, fan_user_ids)
+            await self._maybe_emit_final(game, favorite_names, fan_user_ids)
             self._tracked_dates.pop(game.id, None)
             return IDLE_INTERVAL_SECONDS
 
         self._tracked_dates[game.id] = espn_date
-        self._touched_at[game.id] = self._now()
 
         if game.state == "in":
             return LIVE_INTERVAL_SECONDS
@@ -228,7 +239,7 @@ class SportsAlertsAgent(IJarvisAgent):
 
     # ── Emission ──────────────────────────────────────────────────────────
 
-    def _maybe_emit_final(
+    async def _maybe_emit_final(
         self, game, favorite_names: List[str], fan_user_ids: List[int]
     ) -> None:
         if game.home_score is None or game.away_score is None:
@@ -240,25 +251,31 @@ class SportsAlertsAgent(IJarvisAgent):
         league_value = game.league.value
         winner = self._winner(game)
         summary = self._summary(game, winner)
+        facts = {
+            "event_id": str(game.id),
+            "league": league_value,
+            "home_team": game.home_team,
+            "away_team": game.away_team,
+            "home_score": game.home_score,
+            "away_score": game.away_score,
+            "winner": winner,
+            "favorite_teams": favorite_names,
+            "fan_user_ids": fan_user_ids,
+        }
         try:
-            tag = JarvisSignals(SOURCE_AGENT).emit(
-                kind=SIGNAL_KIND,
-                source_key=f"game:{league_value}:{game.id}",
-                subject=str(game.id),
-                summary=summary,
-                facts={
-                    "event_id": str(game.id),
-                    "league": league_value,
-                    "home_team": game.home_team,
-                    "away_team": game.away_team,
-                    "home_score": game.home_score,
-                    "away_score": game.away_score,
-                    "winner": winner,
-                    "favorite_teams": favorite_names,
-                    "fan_user_ids": fan_user_ids,
-                },
-                ttl_seconds=SIGNAL_TTL_SECONDS,
-                cacheable=False,
+            # emit() POSTs to command-center synchronously — offload so a slow/
+            # unreachable CC (esp. the restart re-emit burst) can't stall the
+            # shared agent loop and starve sibling agents.
+            tag = await asyncio.to_thread(
+                lambda: JarvisSignals(SOURCE_AGENT).emit(
+                    kind=SIGNAL_KIND,
+                    source_key=f"game:{league_value}:{game.id}",
+                    subject=str(game.id),
+                    summary=summary,
+                    facts=facts,
+                    ttl_seconds=SIGNAL_TTL_SECONDS,
+                    cacheable=False,
+                )
             )
         except Exception as e:  # noqa: BLE001
             logger.error("game.final emit raised", event_id=game.id, error=str(e))
