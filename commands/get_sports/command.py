@@ -5,10 +5,12 @@ from jarvis_command_sdk import (
     CommandAntipattern,
     CommandExample,
     CommandResponse,
+    FieldSpec,
     IJarvisCommand,
     IJarvisParameter,
     IJarvisSecret,
     JarvisParameter,
+    RecordSummary,
     RequestInformation,
     ValidationResult,
 )
@@ -31,6 +33,19 @@ try:
 except ImportError:
     ESPNSportsService = None
     Game = None
+
+try:
+    from sports_shared.favorites import (
+        league_label,
+        league_values,
+        parse_favorites,
+        resolve_in_league,
+    )
+except ImportError:
+    league_label = None
+    league_values = None
+    parse_favorites = None
+    resolve_in_league = None
 
 try:
     from utils.timezone_util import format_datetime_local, convert_utc_to_local
@@ -102,6 +117,89 @@ class SportsCommand(IJarvisCommand):
                 description="General web searches, news, or queries without a specific team name.",
             ),
         ]
+
+    # ── Favorite teams (mobile data browser) ──────────────────────────────
+    # One record per (user, team): {"team_name", "league", "id", "user_id"}.
+    # user_id is stamped server-side from the authenticated caller and is the
+    # same id space the sports_alerts agent uses for game.final fan targeting.
+
+    def editable_fields(self) -> List[FieldSpec]:
+        return [
+            FieldSpec(
+                "team_name",
+                "string",
+                label="Team",
+                required=True,
+                placeholder="e.g. Purdue, Mets, Packers",
+            ),
+            FieldSpec(
+                "league",
+                "enum",
+                label="League",
+                required=True,
+                enum_values=league_values() if league_values else [],
+            ),
+            FieldSpec("user_id", "user_ref", label="Fan", editable=False),
+        ]
+
+    @property
+    def data_browser_supports_create(self) -> bool:
+        return True
+
+    def display_summary(self, record: dict) -> RecordSummary:
+        team = record.get("team_name")
+        title = str(team) if team else "Favorite team"
+        league = record.get("league")
+        subtitle = league_label(league) if league_label else league
+        return RecordSummary(title=title, subtitle=subtitle, icon="star-outline")
+
+    def data_browser_create(
+        self, fields: dict[str, Any], requesting_user_id: int | None
+    ) -> tuple[str, dict[str, Any]]:
+        team_name = str(fields.get("team_name") or "").strip()
+        league = fields.get("league")
+        if not team_name:
+            raise ValueError("team_name is required")
+        valid_leagues = league_values() if league_values else []
+        if league not in valid_leagues:
+            raise ValueError(
+                f"league must be one of: {', '.join(valid_leagues)}"
+            )
+        if resolve_in_league is not None:
+            matches = resolve_in_league(team_name, league)
+            if not matches:
+                raise ValueError(
+                    f"team_name '{team_name}' doesn't match any "
+                    f"{league_label(league)} team"
+                )
+        if self._is_duplicate_favorite(team_name, league, requesting_user_id):
+            raise ValueError(
+                f"team_name '{team_name}' is already a favorite for this user"
+            )
+        return super().data_browser_create(
+            {**fields, "team_name": team_name}, requesting_user_id
+        )
+
+    def _is_duplicate_favorite(
+        self, team_name: str, league: str, user_id: int | None
+    ) -> bool:
+        if parse_favorites is None:
+            return False
+        try:
+            from jarvis_command_sdk import JarvisStorage
+
+            existing = parse_favorites(
+                JarvisStorage(self.data_browser_storage_name).get_all()
+            )
+        except Exception:
+            return False
+        wanted = team_name.casefold()
+        return any(
+            fav.user_id == user_id
+            and fav.league == league
+            and fav.team_name.casefold() == wanted
+            for fav in existing
+        )
 
     def generate_prompt_examples(self) -> List[CommandExample]:
         return [
